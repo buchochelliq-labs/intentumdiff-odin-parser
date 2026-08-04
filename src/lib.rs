@@ -13,7 +13,7 @@
 //! - Constant declarations whose rhs is a struct/enum literal are also surfaced as
 //!   class-like (Odin idiom: `MyStruct :: struct { ... }`).
 
-use intentumdiff_plugin_sdk::{
+use intentdiff_plugin_sdk::{
     cst::CstNode,
     hash::structural_hash_with_memo,
     tree::{SemanticNode, SemanticNodeBuilder},
@@ -24,15 +24,15 @@ wit_bindgen::generate!({
     world: "parser-plugin",
 });
 
-use crate::exports::intentumdiff::plugin::parser::ExamplePair;
-use crate::exports::intentumdiff::plugin::parser::Guest;
-use crate::exports::intentumdiff::plugin::parser::LanguageInfoRecord;
-use crate::exports::intentumdiff::plugin::parser::ParserMode;
+use crate::exports::intentdiff::plugin::parser::ExamplePair;
+use crate::exports::intentdiff::plugin::parser::Guest;
+use crate::exports::intentdiff::plugin::parser::LanguageInfoRecord;
+use crate::exports::intentdiff::plugin::parser::ParserMode;
 
 const PLUGIN_METADATA: &str = include_str!("../plugin_metadata.info");
 
 fn language_info_for(ids: Vec<String>) -> Vec<LanguageInfoRecord> {
-    let metadata = intentumdiff_plugin_sdk::metadata::parse_plugin_metadata(PLUGIN_METADATA);
+    let metadata = intentdiff_plugin_sdk::metadata::parse_plugin_metadata(PLUGIN_METADATA);
     ids.into_iter()
         .map(|language_id| {
             let info = metadata.language_or_default(&language_id);
@@ -236,7 +236,7 @@ fn convert(
     // #46: literal leaves are review content — the passthrough dropped them, so a
     // numeric bump (`add(3, 4)` -> `add(4, 4)`) or a string edit hashed style-only.
     if node.children.is_empty()
-        && intentumdiff_plugin_sdk::ts_convert::cst_literal_kind(&node.node_type)
+        && intentdiff_plugin_sdk::ts_convert::cst_literal_kind(&node.node_type)
     {
         let text: String = node.text_or_empty().trim().chars().take(120).collect();
         if !text.is_empty() {
@@ -389,8 +389,8 @@ export!(OdinParser);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exports::intentumdiff::plugin::parser::Guest;
-    use intentumdiff_plugin_sdk::testing as t;
+    use crate::exports::intentdiff::plugin::parser::Guest;
+    use intentdiff_plugin_sdk::testing as t;
 
     #[test]
     fn grammar_id_nonempty() {
