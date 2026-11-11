@@ -161,6 +161,7 @@ fn convert(
     node: &CstNode,
     id_prefix: &str,
     current_class: Option<&str>,
+    parent_type: Option<&str>,
     memo: &mut std::collections::HashMap<usize, String>,
 ) -> Option<SemanticNode> {
     if is_trivia(&node.node_type) {
@@ -193,7 +194,15 @@ fn convert(
             .children
             .iter()
             .enumerate()
-            .filter_map(|(i, c)| convert(c, &format!("{}.{}", id_prefix, i), Some(&label), memo))
+            .filter_map(|(i, c)| {
+                convert(
+                    c,
+                    &format!("{}.{}", id_prefix, i),
+                    Some(&label),
+                    Some(&node.node_type),
+                    memo,
+                )
+            })
             .collect();
         let builder = SemanticNodeBuilder::new(
             id_prefix,
@@ -214,7 +223,15 @@ fn convert(
             .children
             .iter()
             .enumerate()
-            .filter_map(|(i, c)| convert(c, &format!("{}.{}", id_prefix, i), current_class, memo))
+            .filter_map(|(i, c)| {
+                convert(
+                    c,
+                    &format!("{}.{}", id_prefix, i),
+                    current_class,
+                    Some(&node.node_type),
+                    memo,
+                )
+            })
             .collect();
         let mut builder = SemanticNodeBuilder::new(
             id_prefix,
@@ -231,6 +248,28 @@ fn convert(
             builder = builder.parent_type(cls.to_string());
         }
         return Some(builder.build());
+    }
+
+    // odin-parser#4: an anonymous operator token is review content. Emit it as an
+    // `operator` leaf labelled with the exact token, at the token's own span.
+    if !node.named
+        && node.children.is_empty()
+        && parent_type.is_some_and(carries_operators)
+        && is_operator_token(node.text_or_empty())
+    {
+        return Some(
+            SemanticNodeBuilder::new(
+                id_prefix,
+                OPERATOR_NODE_TYPE.to_string(),
+                node.text_or_empty().to_string(),
+                node.start_line,
+                node.start_col,
+                node.end_line,
+                node.end_col,
+                hash,
+            )
+            .build(),
+        );
     }
 
     // #46: literal leaves are review content — the passthrough dropped them, so a
@@ -262,9 +301,20 @@ fn convert(
         .children
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| convert(c, &format!("{}.{}", id_prefix, i), current_class, memo))
+        .filter_map(|(i, c)| {
+            convert(
+                c,
+                &format!("{}.{}", id_prefix, i),
+                current_class,
+                Some(&node.node_type),
+                memo,
+            )
+        })
         .collect();
-    if children.len() == 1 {
+    // Keep an operator's enclosing expression so the `operator` leaf stays under its
+    // operator-bearing parent (the host's contract), rather than collapsing onto it.
+    let has_operator = children.iter().any(|c| c.node_type == OPERATOR_NODE_TYPE);
+    if children.len() == 1 && !has_operator {
         return Some(children.into_iter().next().unwrap());
     }
     if !children.is_empty() {
@@ -283,20 +333,73 @@ fn convert(
     None
 }
 
+/// Node type of the semantic leaf that carries one operator token; its label is the exact
+/// token (`+`, `..<`, `or_else`). Matches the host contract in core's `operator_tokens.rs`
+/// (core #229/#230), so the host recognises guest-emitted operators and skips its source
+/// recovery.
+const OPERATOR_NODE_TYPE: &str = "operator";
+
+/// Odin's word-spelled operators (tree-sitter keeps them as anonymous tokens).
+const WORD_OPERATORS: &[&str] = &[
+    "in",
+    "not_in",
+    "or_else",
+    "or_return",
+    "or_break",
+    "or_continue",
+];
+
+/// Range operators: `0..<n` and `0..=n` iterate different element counts.
+const RANGE_OPERATORS: &[&str] = &["..<", "..=", ".."];
+
+const OPERATOR_SYMBOLS: &[char] = &[
+    '+', '-', '*', '/', '%', '<', '>', '=', '!', '&', '|', '^', '~', '?',
+];
+
+/// Is this anonymous token an operator that changes behaviour?
+///
+/// `->` (procedure result arrow) is declaration syntax, not an operator.
+fn is_operator_token(token: &str) -> bool {
+    if token.is_empty() || token == "->" {
+        return false;
+    }
+    token.chars().all(|c| OPERATOR_SYMBOLS.contains(&c))
+        || WORD_OPERATORS.contains(&token)
+        || RANGE_OPERATORS.contains(&token)
+}
+
+/// Does *parent_type* carry its anonymous operator tokens as review content?
+///
+/// Declarations are excluded: their `=`/`::` never changes on its own (the declaration's
+/// own node type and hash already capture it) and would only add noise.
+fn carries_operators(parent_type: &str) -> bool {
+    !(parent_type.contains("declaration") || parent_type.contains("definition"))
+}
+
+/// Tree-sitter → CstNode under the complete-token contract (odin-parser#4).
+///
+/// * Every token is kept, named AND anonymous (operators, keywords, qualifiers), so two
+///   sources that differ only in an anonymous token never hash equal. The old converter
+///   walked named children only, so `a + b` and `a - b` produced identical trees.
+/// * Trivia (comments) is dropped here, so comment edits never reach structural hashes.
+/// * Text-literal kinds (string/rune/number/float) stay leaves carrying their full text.
+/// * Leaf text is the complete source payload: no length cap, so a long literal's tail
+///   edit still changes the hash.
+/// * Positions are 0-based rows and UTF-8 byte columns (tree-sitter's native units).
 fn node_to_cst(node: tree_sitter::Node<'_>, source: &[u8]) -> CstNode {
-    let children: Vec<CstNode> = (0..node.named_child_count())
-        .filter_map(|i| node.named_child(i))
-        .map(|child| node_to_cst(child, source))
-        .collect();
+    let literal = intentumdiff_plugin_sdk::ts_convert::cst_literal_kind(node.kind());
+    let children: Vec<CstNode> = if literal {
+        Vec::new()
+    } else {
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .filter(|child| !is_trivia(child.kind()))
+            .map(|child| node_to_cst(child, source))
+            .collect()
+    };
 
     let text = if children.is_empty() {
-        Some(
-            node.utf8_text(source)
-                .unwrap_or("")
-                .chars()
-                .take(4096)
-                .collect(),
-        )
+        Some(node.utf8_text(source).unwrap_or("").to_string())
     } else {
         None
     };
@@ -331,7 +434,7 @@ fn process_impl(source: &str) -> String {
         Err(e) => return format!(r#"{{\"error\":\"{}\"}}"#, e),
     };
     let mut memo = std::collections::HashMap::new();
-    let sem = match convert(&root, "0", None, &mut memo) {
+    let sem = match convert(&root, "0", None, None, &mut memo) {
         Some(n) => n,
         None => return r#"{"error":"Empty semantic tree"}"#.to_string(),
     };
@@ -447,5 +550,177 @@ mod tests {
     fn process_impl_whitespace_returns_valid_json() {
         let out = process_impl("   \n  ");
         t::assert_valid_json(&out, "process(whitespace)");
+    }
+
+    // -----------------------------------------------------------------------
+    // odin-parser#4: operator tokens survive the CST converter
+    // -----------------------------------------------------------------------
+
+    fn tree(src: &str) -> serde_json::Value {
+        let out = process_impl(src);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert!(v.get("error").is_none(), "{out}");
+        v
+    }
+
+    fn collect<'a>(n: &'a serde_json::Value, ty: &str, out: &mut Vec<&'a serde_json::Value>) {
+        if n["node_type"] == ty {
+            out.push(n);
+        }
+        if let Some(cs) = n["children"].as_array() {
+            for c in cs {
+                collect(c, ty, out);
+            }
+        }
+    }
+
+    fn find_label<'a>(n: &'a serde_json::Value, label: &str) -> Option<&'a serde_json::Value> {
+        if n["label"] == label {
+            return Some(n);
+        }
+        n["children"]
+            .as_array()?
+            .iter()
+            .find_map(|c| find_label(c, label))
+    }
+
+    fn operators(src: &str) -> Vec<(String, [u64; 4], String)> {
+        let v = tree(src);
+        let mut ops = Vec::new();
+        collect(&v, OPERATOR_NODE_TYPE, &mut ops);
+        ops.iter()
+            .map(|o| {
+                let p = &o["position"];
+                (
+                    o["label"].as_str().unwrap().to_string(),
+                    [
+                        p["start_line"].as_u64().unwrap(),
+                        p["start_col"].as_u64().unwrap(),
+                        p["end_line"].as_u64().unwrap(),
+                        p["end_col"].as_u64().unwrap(),
+                    ],
+                    o["structural_hash"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn proc_hash(src: &str, name: &str) -> String {
+        let v = tree(src);
+        find_label(&v, name).expect("proc present")["structural_hash"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    const PLUS: &str = "package probe\ncombine :: proc(a, b: int) -> int { return a + b }\n";
+    const MINUS: &str = "package probe\ncombine :: proc(a, b: int) -> int { return a - b }\n";
+
+    #[test]
+    fn body_operator_edit_is_a_real_change() {
+        // Exact pair of core's `odin-body-operator` assessment case.
+        let old = operators(PLUS);
+        let new = operators(MINUS);
+        assert_eq!(old.len(), 1, "{old:?}");
+        assert_eq!(new.len(), 1, "{new:?}");
+        assert_eq!(old[0].0, "+");
+        assert_eq!(new[0].0, "-");
+        // The token's own span: 0-based row 1, UTF-8 byte columns 45..46.
+        assert_eq!(old[0].1, [1, 45, 1, 46]);
+        assert_eq!(new[0].1, [1, 45, 1, 46]);
+        assert_ne!(old[0].2, new[0].2);
+        assert_ne!(proc_hash(PLUS, "combine"), proc_hash(MINUS, "combine"));
+    }
+
+    #[test]
+    fn operator_issue_pair_is_a_real_change() {
+        // Exact pair from odin-parser#4.
+        let old = "package main\nf :: proc(a,b:int) -> int { return a + b }\n";
+        let new = "package main\nf :: proc(a,b:int) -> int { return a - b }\n";
+        assert_eq!(operators(old)[0].0, "+");
+        assert_eq!(operators(new)[0].0, "-");
+        assert_ne!(proc_hash(old, "f"), proc_hash(new, "f"));
+    }
+
+    #[test]
+    fn operator_leaf_sits_under_its_expression() {
+        let v = tree(PLUS);
+        let mut exprs = Vec::new();
+        collect(&v, "binary_expression", &mut exprs);
+        assert_eq!(exprs.len(), 1);
+        let kids = exprs[0]["children"].as_array().unwrap();
+        assert!(kids.iter().any(|c| c["node_type"] == OPERATOR_NODE_TYPE));
+    }
+
+    #[test]
+    fn compound_unary_range_and_word_operators_are_kept() {
+        let src = "package probe\nf :: proc(a, b: int, m: Maybe(int)) -> int {\n\tx := a\n\tx += -b\n\tfor i in 0..<b { x |= i }\n\treturn m.? or_else x\n}\n";
+        let labels: Vec<String> = operators(src).into_iter().map(|o| o.0).collect();
+        for op in ["+=", "-", "..<", "|=", "or_else"] {
+            assert!(
+                labels.iter().any(|l| l == op),
+                "{op} missing from {labels:?}"
+            );
+        }
+        // Declaration syntax is not an operator.
+        for not_op in ["::", ":=", "->", ":"] {
+            assert!(
+                !labels.iter().any(|l| l == not_op),
+                "{not_op} in {labels:?}"
+            );
+        }
+        let closed = src.replace("0..<b", "0..=b");
+        assert!(operators(&closed).iter().any(|o| o.0 == "..="));
+        assert_ne!(proc_hash(src, "f"), proc_hash(&closed, "f"));
+    }
+
+    #[test]
+    fn identity_output_is_deterministic() {
+        assert_eq!(process_impl(PLUS), process_impl(PLUS));
+    }
+
+    #[test]
+    fn comments_and_layout_do_not_change_hashes() {
+        let commented = "package probe\ncombine :: proc(a, b: int) -> int { /* sum */ return a + b // done\n}\n";
+        let laid_out =
+            "package probe\n\ncombine :: proc(a, b: int) -> int {\n\treturn a  +  b\n}\n";
+        let base = proc_hash(PLUS, "combine");
+        assert_eq!(proc_hash(commented, "combine"), base);
+        assert_eq!(proc_hash(laid_out, "combine"), base);
+        let v = tree(commented);
+        let mut comments = Vec::new();
+        collect(&v, "comment", &mut comments);
+        collect(&v, "block_comment", &mut comments);
+        assert!(comments.is_empty());
+    }
+
+    #[test]
+    fn long_literal_tail_edit_changes_hash() {
+        // The old converter capped leaf text at 4096 chars, hiding tail edits.
+        let body = "x".repeat(5000);
+        let old = format!("package probe\ns :: proc() -> string {{ return \"{body}a\" }}\n");
+        let new = format!("package probe\ns :: proc() -> string {{ return \"{body}b\" }}\n");
+        assert_ne!(proc_hash(&old, "s"), proc_hash(&new, "s"));
+    }
+
+    #[test]
+    fn literal_value_edit_still_surfaces() {
+        let old = "package probe\nanswer :: proc() -> int { return 1 }\n";
+        let new = "package probe\nanswer :: proc() -> int { return 2 }\n";
+        assert!(find_label(&tree(old), "1").is_some());
+        assert!(find_label(&tree(new), "2").is_some());
+    }
+
+    #[test]
+    fn multibyte_source_keeps_byte_columns() {
+        let src = "package probe\ncombine :: proc(a, b: int) -> int { s := \"\u{e9}\u{e9}\"; return a + b }\n";
+        let ops = operators(src);
+        let line = src.lines().nth(1).unwrap();
+        let col = line.find(" + ").unwrap() as u64 + 1;
+        assert!(
+            ops.iter()
+                .any(|o| o.0 == "+" && o.1 == [1, col, 1, col + 1]),
+            "{ops:?}"
+        );
     }
 }
