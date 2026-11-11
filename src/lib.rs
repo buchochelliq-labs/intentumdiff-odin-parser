@@ -376,12 +376,25 @@ fn carries_operators(parent_type: &str) -> bool {
     !(parent_type.contains("declaration") || parent_type.contains("definition"))
 }
 
+/// Rules whose statements are joined by the grammar's `_separator` (a hidden newline or
+/// an explicit `;`). The newline form leaves no token, so the `;` form is dropped too.
+const SEPARATED_RULES: &[&str] = &["source_file", "block", "switch_case", "switch_statement"];
+
+/// Is *child* an optional statement separator `;` of *parent_kind* (odin-parser#6)?
+///
+/// Only the `_separator` positions qualify; `;` in `for`/`if` clauses and `bit_set[T; U]`
+/// is required syntax and stays.
+fn is_optional_separator(parent_kind: &str, child: tree_sitter::Node<'_>) -> bool {
+    !child.is_named() && child.kind() == ";" && SEPARATED_RULES.contains(&parent_kind)
+}
+
 /// Tree-sitter → CstNode under the complete-token contract (odin-parser#4).
 ///
 /// * Every token is kept, named AND anonymous (operators, keywords, qualifiers), so two
 ///   sources that differ only in an anonymous token never hash equal. The old converter
 ///   walked named children only, so `a + b` and `a - b` produced identical trees.
 /// * Trivia (comments) is dropped here, so comment edits never reach structural hashes.
+/// * Optional `;` statement separators are dropped, so `x := 1;` hashes like `x := 1`.
 /// * Text-literal kinds (string/rune/number/float) stay leaves carrying their full text.
 /// * Leaf text is the complete source payload: no length cap, so a long literal's tail
 ///   edit still changes the hash.
@@ -394,6 +407,7 @@ fn node_to_cst(node: tree_sitter::Node<'_>, source: &[u8]) -> CstNode {
         let mut cursor = node.walk();
         node.children(&mut cursor)
             .filter(|child| !is_trivia(child.kind()))
+            .filter(|child| !is_optional_separator(node.kind(), *child))
             .map(|child| node_to_cst(child, source))
             .collect()
     };
@@ -722,5 +736,40 @@ mod tests {
                 .any(|o| o.0 == "+" && o.1 == [1, col, 1, col + 1]),
             "{ops:?}"
         );
+    }
+
+    #[test]
+    fn optional_statement_separators_do_not_change_hashes() {
+        // Exact pair from odin-parser#6: an explicit `;` terminator is optional.
+        let old = "main :: proc() {\n\tx := 1\n}";
+        let new = "main :: proc() {\n\tx := 1;\n}";
+        assert_eq!(proc_hash(old, "main"), proc_hash(new, "main"));
+        assert_eq!(tree(old)["structural_hash"], tree(new)["structural_hash"]);
+        let one_line = "package p\nmain :: proc() { x := 1; y := 2; }\n";
+        let lines = "package p\nmain :: proc() {\n\tx := 1\n\ty := 2\n}\n";
+        assert_eq!(proc_hash(one_line, "main"), proc_hash(lines, "main"));
+        assert_eq!(
+            tree("package p;\nimport \"core:fmt\";\n")["structural_hash"],
+            tree("package p\nimport \"core:fmt\"\n")["structural_hash"]
+        );
+        // Operators stay meaningful.
+        assert_ne!(
+            proc_hash("main :: proc() {\n\tx := 1 + 2;\n}", "main"),
+            proc_hash("main :: proc() {\n\tx := 1 - 2;\n}", "main")
+        );
+        // `for` clause separators are syntax, not terminators: they stay in the CST.
+        fn semicolons(n: &CstNode, parent: &str, out: &mut Vec<String>) {
+            if n.node_type == ";" {
+                out.push(parent.to_string());
+            }
+            for c in &n.children {
+                semicolons(c, &n.node_type, out);
+            }
+        }
+        let cst =
+            parse_source("package p;\nf :: proc() { for i := 0; i < 3; i += 1 { }; }\n").unwrap();
+        let mut parents = Vec::new();
+        semicolons(&cst, "", &mut parents);
+        assert_eq!(parents, ["for_statement", "for_statement"]);
     }
 }
